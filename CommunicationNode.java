@@ -4,15 +4,12 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.HashMap;
 import java.util.Map;
-import java.util.function.Consumer;
 import java.util.ArrayList;
-import java.util.List;
 import java.util.Collections;
 import java.util.Comparator;
 import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.Arrays;
-import java.util.Queue;
 
 public class CommunicationNode {
     private OtpNode node;
@@ -24,6 +21,7 @@ public class CommunicationNode {
     private Map<String, ArrayList<String>> joinRequests;
     private ArrayList<String> privateContacts; // will contain the node addresses who chats with the user
     private int maxMessageHistorySize;
+    private String name;
 
     public CommunicationNode(String nodeName, int maxMessageHistorySize, int poolSize) throws Exception {
         this.maxMessageHistorySize = maxMessageHistorySize;
@@ -31,8 +29,9 @@ public class CommunicationNode {
         groupInfo = new HashMap<>();
         joinRequests = new HashMap<>();
         messageHistory = new HashMap<>();
+        name = nodeName;
         try {
-            String ipAddress = InetAddress.getLocalHost().getHostAddress();
+            String ipAddress = InetAddress.getLocalHost().getHostName();
             address = nodeName + "@" + ipAddress;
             node = new OtpNode(nodeName);
             System.out.println("Node " + nodeName + " created successfully at " + address);
@@ -40,7 +39,6 @@ public class CommunicationNode {
             mailboxes = new HashMap<>();
             createMailbox(nodeName); // the mailbox that shares the same name with the username will handle private
                                      // messages.
-            receiveMessages(); // Start listening for messages after setup
         } catch (Exception e) {
             System.err.println("Error creating JInterface node: " + e.getMessage());
             throw e;
@@ -51,6 +49,20 @@ public class CommunicationNode {
         OtpMbox mbox = node.createMbox(mboxName);
         mailboxes.put(mboxName, mbox); // put the new mailbox to the hash table
         messageHistory.put(mboxName, new ArrayList<>()); // Initialize message history for the new mailbox
+        executorService.submit(() -> { // start listening messages on mailbox
+            while (true) {
+                try {
+                    OtpErlangObject o = mbox.receive();
+                    if (o instanceof OtpErlangTuple) {
+                        OtpErlangTuple msgTuple = (OtpErlangTuple) o;
+                        handleMessage(mboxName, msgTuple);
+                    }
+                } catch (Exception e) {
+                    System.err.println("Error receiving message on mailbox " + mboxName + ": " + e.getMessage());
+                }
+            }
+        });
+
         return mbox;
     }
 
@@ -70,10 +82,14 @@ public class CommunicationNode {
         return privateContacts;
     }
 
+    public ArrayList<String> getGroupNames() {
+        return new ArrayList<String>(groupInfo.keySet());
+    }
+
     public OtpErlangTuple createMessage(OtpErlangPid pid, String content, String type) {
         SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
         String timeStamp = sdf.format(new Date());
-        OtpErlangObject[] msgContent = new OtpErlangObject[4];
+        OtpErlangObject[] msgContent = new OtpErlangObject[5];
         msgContent[0] = pid;
         msgContent[1] = new OtpErlangString(this.address);
         msgContent[2] = new OtpErlangString(content);
@@ -83,12 +99,15 @@ public class CommunicationNode {
         return new OtpErlangTuple(msgContent);
     }
 
+    // sends a message in general. It could be a group message, a private message or
+    // a request.
     public OtpErlangTuple sendMessage(String mboxName, String nodeAddress, String content, String type) {
-        OtpMbox mbox = mailboxes.get(mboxName);
+        OtpMbox mbox = mailboxes.get(name);
         if (mbox != null) {
             try {
                 OtpErlangTuple msg = createMessage(mbox.self(), content, type);
                 mbox.send(mboxName, nodeAddress, msg);
+                System.out.println("message sent: " + msg + "" + nodeAddress);
                 return msg;
             } catch (Exception e) {
                 System.err.println(
@@ -102,30 +121,12 @@ public class CommunicationNode {
     }
 
     public void broadcastMessage(String mboxName, ArrayList<String> nodeAddresses, String content, String type) {
-        for (String nodeAddress : nodeAddresses) {
-            sendMessage(mboxName, nodeAddress, content, type);
-        }
-    }
-
-    // mailboxes share the same name with the group names, it makes it easier to
-    // identify them and give parameters
-    public void receiveMessages() {
-        for (Map.Entry<String, OtpMbox> entry : mailboxes.entrySet()) {
-            String mboxName = entry.getKey();
-            OtpMbox mbox = entry.getValue();
-            executorService.submit(() -> {
-                while (true) {
-                    try {
-                        OtpErlangObject o = mbox.receive();
-                        if (o instanceof OtpErlangTuple) {
-                            OtpErlangTuple msgTuple = (OtpErlangTuple) o;
-                            handleMessage(mboxName, msgTuple);
-                        }
-                    } catch (Exception e) {
-                        System.err.println("Error receiving message on mailbox " + mboxName + ": " + e.getMessage());
-                    }
-                }
-            });
+        if (nodeAddresses != null && !nodeAddresses.isEmpty()) {
+            for (String nodeAddress : nodeAddresses) {
+                sendMessage(mboxName, nodeAddress, content, type);
+            }
+        } else {
+            System.out.println("Node addresses list is empty or null.");
         }
     }
 
@@ -148,6 +149,8 @@ public class CommunicationNode {
             case "add_member":
                 handleAddMember(mboxName, msgTuple);
                 break;
+            case "exiting":
+                handleExitingMember(mboxName, msgTuple);
             default:
                 System.err.println("Unknown message type: " + messageType);
                 break;
@@ -183,12 +186,13 @@ public class CommunicationNode {
             }
             history.add(new Message(msgTuple));
             System.out.println("Group message received: " + msgTuple);
+            sortMessageHistory(mboxName);
         });
     }
 
     private void handleJoinRequest(String mboxName, OtpErlangTuple msgTuple) {
         executorService.submit(() -> {
-            String groupName = ((OtpErlangString) msgTuple.elementAt(2)).stringValue();
+            String groupName = mboxName;
             String requesterAddress = ((OtpErlangString) msgTuple.elementAt(1)).stringValue();
             addNewRequest(groupName, requesterAddress);
             System.out.println("Join request received: " + msgTuple);
@@ -207,12 +211,20 @@ public class CommunicationNode {
         executorService.submit(() -> {
             String member = ((OtpErlangString) msgTuple.elementAt(2)).stringValue();
             addMembertoGroup(mboxName, member);
-            System.out.println("Request accept received: " + msgTuple);
+            System.out.println("Adding new member to group: " + msgTuple);
         });
     }
 
-    public ArrayList<Message> getMessageHistory(String mboxName) {
-        return messageHistory.get(mboxName);
+    private void handleExitingMember(String mboxName, OtpErlangTuple msgTuple) {
+        executorService.submit(() -> {
+            String senderAddress = ((OtpErlangString) msgTuple.elementAt(1)).stringValue();
+            String group = ((OtpErlangString) msgTuple.elementAt(2)).stringValue();
+            groupInfo.get(group).remove(senderAddress);
+        });
+    }
+
+    public ArrayList<Message> getMessageHistory(String name) {
+        return messageHistory.get(name);
     }
 
     private void sortMessageHistory(String mboxName) {
@@ -220,15 +232,16 @@ public class CommunicationNode {
         Collections.sort(history, Comparator.comparing(Message::getTimeStamp));
     }
 
-    public boolean createGroup(String groupName) {
+    public int createGroup(String groupName) {
         if (groupInfo.containsKey(groupName)) {
-            return false;
+            return 1; // group already exist
         } else {
+            createMailbox(groupName);
             groupInfo.put(groupName, new ArrayList<>());
             joinRequests.put(groupName, new ArrayList<>());
-            ArrayList<String> members = groupInfo.get(groupName);
-            members.add(this.address); // when creating a group, you need to add yourself to the group
-            return true;
+            groupInfo.get(groupName).add(this.address);// when creating a group, you need to add yourself to the group
+            System.out.println("new group created.");
+            return 0;
         }
     }
 
@@ -251,6 +264,7 @@ public class CommunicationNode {
             createMailbox(receivedGroupName); // the mailbox where the user will receive its group messages
             ArrayList<String> memberList = new ArrayList<>(Arrays.asList(parts).subList(1, parts.length));
             groupInfo.put(receivedGroupName, memberList);
+            groupInfo.get(receivedGroupName).add(address);
             joinRequests.put(receivedGroupName, new ArrayList<>());
         } catch (Exception e) {
             System.err.println("Couldn't add the group: " + e.getMessage());
@@ -280,6 +294,15 @@ public class CommunicationNode {
             history.remove(0); // Remove the oldest message
         }
         sortMessageHistory(receiverName);
+    }
+
+    public void exitGroup(String groupName) {
+        groupInfo.get(groupName).remove(address);
+        broadcastMessage(groupName, groupInfo.get(groupName), groupName, "exiting");
+        groupInfo.remove(groupName);
+        joinRequests.remove(groupName);
+        mailboxes.remove(groupName);
+        messageHistory.remove(groupName);
     }
 
     public void shutdown() {
