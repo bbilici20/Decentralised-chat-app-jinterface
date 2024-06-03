@@ -56,3 +56,8 @@ Home Page: Displays user options.</br>
 Chat Pages: Shows chat interfaces.</br>
 ### Refresh Method
 The refreshPages method updates the content of the currently visible page to reflect new data, ensuring real-time chat updates.
+
+### Future Improvements
+-The message history will be provided with a database.</br>
+-The refresh method for the chat windows will be added.</br>
+-The broadcasting method may or may not be revised as a tree structure instead of array (broadcasting of a message will depend on every node in the group, not just the sender).</br>
